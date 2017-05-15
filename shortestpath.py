@@ -1,0 +1,321 @@
+
+
+import logging
+import struct
+
+from ryu.base import app_manager
+from ryu.controller import mac_to_port
+from ryu.controller import ofp_event
+from ryu.controller.handler import MAIN_DISPATCHER, DEAD_DISPATCHER ,CONFIG_DISPATCHER
+from ryu.controller.handler import set_ev_cls
+from ryu.ofproto import ofproto_v1_3
+from ryu.lib.mac import haddr_to_bin
+from ryu.lib.packet import packet
+from ryu.lib.packet import ethernet
+from ryu.lib.packet import ether_types
+from ryu.topology.api import get_switch, get_link
+from ryu.app.wsgi import ControllerBase
+from ryu.topology import event, switches
+import networkx as nx
+from ryu.lib.packet import ipv4
+from ryu.lib.packet import arp
+from ryu.lib import hub
+import setting
+
+
+#PRIORITY_MAX = ofproto_v1_3_parser.UINT16_MAX - 1
+
+
+class ProjectController(app_manager.RyuApp):
+    OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
+
+    def __init__(self, *args, **kwargs):
+        super(ProjectController, self).__init__(*args, **kwargs)
+        self.mac_to_port = {}
+        self.access_table = {}  # {(sw,port) :[host1_ip]}
+        self.topology_api_app = self
+        self.switch_port_table = {}  # dpip->port_num
+        self.access_ports = {}       # dpid->port_num
+        self.interior_ports = {}     # dpid->port_num
+        self.sw_host={}
+        self.net = nx.DiGraph()
+        self.nodes = {}
+        self.links = {}
+        self.datapaths={}
+        self.hosts={}
+        self.no_of_nodes = 0
+        self.no_of_links = 0
+        self.i = 0
+        #self.discover_thread = hub.spawn(self._discover)
+
+    @set_ev_cls(ofp_event.EventOFPStateChange,
+                [MAIN_DISPATCHER, DEAD_DISPATCHER])
+    def _state_change_handler(self, ev):
+        """
+            Collect datapath information.
+        """
+        datapath = ev.datapath
+        if ev.state == MAIN_DISPATCHER:
+            if not datapath.id in self.datapaths:
+                self.logger.debug('register datapath: %016x', datapath.id)
+                self.datapaths[datapath.id] = datapath
+        elif ev.state == DEAD_DISPATCHER:
+            if datapath.id in self.datapaths:
+                self.logger.debug('unregister datapath: %016x', datapath.id)
+                del self.datapaths[datapath.id]
+
+    def add_flow(self, datapath, priority, match, actions, buffer_id=None):
+        '''ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+
+        inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS,
+                                             actions)]
+        if buffer_id:
+            mod = parser.OFPFlowMod(datapath=datapath, buffer_id=buffer_id,
+                                    priority=priority, match=match,
+                                    instructions=inst)
+        else:
+            mod = parser.OFPFlowMod(datapath=datapath, priority=priority,
+                                    match=match, instructions=inst)
+        datapath.send_msg(mod)'''
+        self.send_flow_mod(datapath, 1, priority, match, actions, buffer_id)
+
+    def modflow(self, datapath, table_id, priority, match, instructions, buffer_id=None):
+        ofp = datapath.ofproto
+        ofp_parser = datapath.ofproto_parser
+        cookie = cookie_mask = 0
+        idle_timeout = hard_timeout = 0
+        if buffer_id:
+            req = ofp_parser.OFPFlowMod(datapath=datapath, cookie=cookie, cookie_mask=cookie_mask,
+                                    table_id=table_id, command=ofp.OFPFC_ADD,
+                                    idle_timeout=idle_timeout, hard_timeout=hard_timeout,
+                                    priority=priority, buffer_id=buffer_id,
+                                    match=match, instructions=instructions)
+        else:
+            req = ofp_parser.OFPFlowMod(datapath=datapath, cookie=cookie, cookie_mask=cookie_mask,
+                                        table_id=table_id, command=ofp.OFPFC_ADD,
+                                        idle_timeout=idle_timeout, hard_timeout=hard_timeout,
+                                        priority=priority, buffer_id=ofp.OFP_NO_BUFFER,
+                                        match=match, instructions=instructions)
+
+        datapath.send_msg(req)
+
+
+    def send_flow_mod(self, datapath, table_id, priority, match, actions,flag=1, buffer_id=None):
+        ofp = datapath.ofproto
+        ofp_parser = datapath.ofproto_parser
+        cookie = cookie_mask = 0
+        idle_timeout = hard_timeout = 0
+        if flag == 1:
+            inst = [ofp_parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, actions)]
+        else:
+            inst = actions
+
+        if buffer_id:
+            req = ofp_parser.OFPFlowMod(datapath=datapath, cookie=cookie, cookie_mask=cookie_mask,
+                                    table_id=table_id, command=ofp.OFPFC_ADD,
+                                    idle_timeout=idle_timeout, hard_timeout=hard_timeout,
+                                    priority=priority, buffer_id=buffer_id,
+                                    match=match, instructions=inst)
+        else:
+            req = ofp_parser.OFPFlowMod(datapath=datapath, cookie=cookie, cookie_mask=cookie_mask,
+                                        table_id=table_id, command=ofp.OFPFC_ADD,
+                                        idle_timeout=idle_timeout, hard_timeout=hard_timeout,
+                                        priority=priority, buffer_id=ofp.OFP_NO_BUFFER,
+                                        match=match, instructions=inst)
+
+        datapath.send_msg(req)
+
+    # List the event list should be listened.
+    events = [event.EventSwitchEnter,
+                  event.EventSwitchLeave, event.EventPortAdd,
+                  event.EventPortDelete, event.EventPortModify,
+                  event.EventLinkAdd, event.EventLinkDelete]
+
+    @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
+    def _packet_in_handler(self, ev):
+        msg = ev.msg
+        datapath = msg.datapath
+        dpid=datapath.id
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+        pkt = packet.Packet(msg.data)
+        arp_pkt = pkt.get_protocol(arp.arp)
+        ip_pkt = pkt.get_protocol(ipv4.ipv4)
+        in_port = msg.match['in_port']
+        buffer_id = msg.buffer_id
+
+        ints = []
+        if isinstance(arp_pkt, arp.arp):
+            print "ARP processing"
+            arp_src_ip = arp_pkt.src_ip
+            arp_dst_ip = arp_pkt.dst_ip
+            src_mac = arp_pkt.src_mac
+            if arp_src_ip not in self.hosts.keys():
+                self.net.add_node(src_mac,arp_src_ip=src_mac,sw=dpid,port=in_port)
+                self.sw_host[dpid]=[src_mac,in_port]
+                self.hosts[arp_src_ip]=[src_mac,dpid,in_port]
+                self.net.add_edge(src_mac,dpid,{'port': in_port})
+                self.net.add_edge(dpid,src_mac,{'port':in_port})
+            if arp_dst_ip in self.hosts.keys():
+                mac=self.hosts[arp_dst_ip][0]
+                datapath_id, out_port = self.net.node[mac]['sw'], self.net.node[mac]['port']
+                buffer_id=ofproto.OFP_NO_BUFFER
+                datapath=self.datapaths[datapath_id]
+                in_port=ofproto.OFPP_CONTROLLER
+                in_port=in_port
+                print "Reply ARP to knew host"
+            else:
+               # for datapath in self.datapaths:
+                out_port = ofproto.OFPP_FLOOD
+                buffer_id=msg.buffer_id
+                print "Flood ARP"
+            actions = [parser.OFPActionOutput(out_port)]
+            out = parser.OFPPacketOut(datapath=datapath, buffer_id=buffer_id,
+                                      in_port=in_port, actions=actions, data=msg.data)
+            datapath.send_msg(out)
+            return
+
+        if isinstance(ip_pkt, ipv4.ipv4):
+            print "IPV4 processing"
+            eth = pkt.get_protocols(ethernet.ethernet)[0]
+            if eth.ethertype == ether_types.ETH_TYPE_LLDP:
+                # ignore lldp packet
+                return
+            dst = eth.dst
+            src = eth.src
+            src_ip=ip_pkt.src
+            dst_ip=ip_pkt.dst
+            self.mac_to_port.setdefault(dpid, {})
+            if src not in self.net:
+                self.net.add_node(src, ip=src_ip)
+                self.net.add_edge(dpid, src, {'port': in_port})
+                self.net.add_edge(src, dpid,{'port': in_port})
+            if dst in self.net:
+                path = nx.shortest_path(self.net, src, dst)
+                k=len(path)-1
+                for index in range(len(path)-1):
+                    if index==0:
+                        continue
+                    if index==len(path)-1:
+                        continue
+                    dpid=path[index]
+                    pre=path[index-1]
+                    nxt=path[index+1]
+                    in_port = self.net[dpid][pre]['port']
+                    out_port=self.net[dpid][nxt]['port']
+                    match = parser.OFPMatch(in_port=in_port,eth_dst=dst)
+                    actions=[parser.OFPActionOutput(out_port)]
+                    ints.append(parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions))
+                    if msg.buffer_id != ofproto.OFP_NO_BUFFER:
+                        self.modflow(self.datapaths[dpid], 1, 100, match, ints, msg.buffer_id)
+                        print ('add flow ',dpid,match,ints)
+                    else:
+                        self.modflow(self.datapaths[dpid], 1, 100, match, ints)
+                        print ('add flow ', dpid, match, ints)
+                    ints=[]
+
+                ''' out_port = ofproto.OFPP_FLOOD
+                actions = [parser.OFPActionOutput(out_port)]
+                match = parser.OFPMatch(in_port=in_port, eth_dst=dst)
+                if msg.buffer_id != ofproto.OFP_NO_BUFFER:
+                    ints.append(parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions))
+                    self.modflow(datapath, 1, 100, match, actions, msg.buffer_id)
+                    print ('add flow to flood ', dpid, match, ints)
+                    return
+                else:
+                    ints.append(parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions))
+                    self.modflow(datapath, 1, 100, match, ints)
+                    print ('add flow to flood ', dpid, match, ints)
+                ints=[]
+                '''
+                out_port=self.net[path[1]][path[2]]['port']
+                actions=[parser.OFPActionOutput(out_port)]
+                data = None
+                if msg.buffer_id == ofproto.OFP_NO_BUFFER:
+                    data = msg.data
+                out = parser.OFPPacketOut(datapath=datapath, buffer_id=msg.buffer_id,
+                                          in_port=in_port, actions=actions, data=data)
+                datapath.send_msg(out)
+
+    @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
+    def switch_features_handler(self, ev):
+
+        datapath = ev.msg.datapath
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+
+        # install table-miss flow entry
+        #
+        # We specify NO BUFFER to max_len of the output action due to
+        # OVS bug. At this moment, if we specify a lesser number, e.g.,
+        # 128, OVS will send Packet-In with invalid buffer_id and
+        # truncated packet data. In that case, we cannot output packets
+        # correctly.  The bug has been fixed in OVS v2.1.0.
+        match = parser.OFPMatch()
+        insts = []
+        insts.append(parser.OFPInstructionGotoTable(1))
+
+        #self.add_flow(datapath, 0, match, actions)
+        #send_flow_mod(self, datapath, table_id, priority, match, actions, buffer_id=None)
+        #def modflow(self, datapath, table_id, priority, match, instructions, buffer_id=None):
+        self.modflow(datapath,0,100,match,insts)
+        insts = []
+
+        actions=[parser.OFPActionOutput(ofproto.OFPP_CONTROLLER,
+                                          ofproto.OFPCML_NO_BUFFER)]
+        insts.append(parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions))
+
+        self.modflow(datapath, 1, 0, match, insts)
+        match=parser.OFPMatch(vlan_vid=0x0011)
+        insts = []
+        actions=[parser.OFPActionOutput(ofproto.OFPP_CONTROLLER,
+                                          ofproto.OFPCML_NO_BUFFER)]
+        insts.append(parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS,
+                                                  actions))
+        insts.append(parser.OFPInstructionGotoTable(1))
+        self.modflow(datapath,0,101,match,insts)
+        print 'all ready!'
+
+
+
+
+
+
+    @set_ev_cls(event.EventSwitchEnter)
+    def get_topology_data(self, ev):
+        switch_list = get_switch(self.topology_api_app, None)
+        switches = [switch.dp.id for switch in switch_list]
+        self.net.add_nodes_from(switches)
+
+        links_list = get_link(self.topology_api_app, None)
+        # print links_list
+        links = [(link.src.dpid, link.dst.dpid, {'port': link.src.port_no}) for link in links_list]
+        # print links
+        self.net.add_edges_from(links)
+        links = [(link.dst.dpid, link.src.dpid, {'port': link.dst.port_no}) for link in links_list]
+        # print links
+        self.net.add_edges_from(links)
+        print "**********List of links"
+        print self.net.edges()
+        '''
+        for link in links_list:
+            print link.dst
+            print link.src
+            print "Novo link"
+            self.no_of_links += 1
+        '''
+
+
+        # print "@@@@@@@@@@@@@@@@@Printing both arrays@@@@@@@@@@@@@@@"
+        # for node in self.nodes:
+        #    print self.nodes[node]
+        # for link in self.links:
+        #    print self.links[link]
+        # print self.no_of_nodes
+        # print self.no_of_links
+
+        # @set_ev_cls(event.EventLinkAdd)
+        # def get_links(self, ev):
+        # print "################Something##############"
+        # print ev.link.src, ev.link.dst
