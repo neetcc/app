@@ -23,8 +23,6 @@ from ryu.lib import hub
 import setting
 
 
-#PRIORITY_MAX = ofproto_v1_3_parser.UINT16_MAX - 1
-
 
 class ProjectController(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
@@ -37,12 +35,11 @@ class ProjectController(app_manager.RyuApp):
         self.switch_port_table = {}  # dpip->port_num
         self.access_ports = {}       # dpid->port_num
         self.interior_ports = {}     # dpid->port_num
-        self.sw_host={}
         self.net = nx.DiGraph()
         self.nodes = {}
         self.links = {}
-        self.datapaths={}
-        self.hosts={}
+        self.datapaths={} # dpid: datapath the dict to get the datapath from dpid
+        self.hosts={} # host_ip:[host_mac, dpid(the switch connected to), in_port(to the switch)]
         self.no_of_nodes = 0
         self.no_of_links = 0
         self.i = 0
@@ -51,9 +48,7 @@ class ProjectController(app_manager.RyuApp):
     @set_ev_cls(ofp_event.EventOFPStateChange,
                 [MAIN_DISPATCHER, DEAD_DISPATCHER])
     def _state_change_handler(self, ev):
-        """
-            Collect datapath information.
-        """
+        #    Collect datapath information.
         datapath = ev.datapath
         if ev.state == MAIN_DISPATCHER:
             if not datapath.id in self.datapaths:
@@ -63,22 +58,6 @@ class ProjectController(app_manager.RyuApp):
             if datapath.id in self.datapaths:
                 self.logger.debug('unregister datapath: %016x', datapath.id)
                 del self.datapaths[datapath.id]
-
-    def add_flow(self, datapath, priority, match, actions, buffer_id=None):
-        '''ofproto = datapath.ofproto
-        parser = datapath.ofproto_parser
-
-        inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS,
-                                             actions)]
-        if buffer_id:
-            mod = parser.OFPFlowMod(datapath=datapath, buffer_id=buffer_id,
-                                    priority=priority, match=match,
-                                    instructions=inst)
-        else:
-            mod = parser.OFPFlowMod(datapath=datapath, priority=priority,
-                                    match=match, instructions=inst)
-        datapath.send_msg(mod)'''
-        self.send_flow_mod(datapath, 1, priority, match, actions, buffer_id)
 
     def modflow(self, datapath, table_id, priority, match, instructions, buffer_id=None):
         ofp = datapath.ofproto
@@ -100,43 +79,11 @@ class ProjectController(app_manager.RyuApp):
 
         datapath.send_msg(req)
 
-
-    def send_flow_mod(self, datapath, table_id, priority, match, actions,flag=1, buffer_id=None):
-        ofp = datapath.ofproto
-        ofp_parser = datapath.ofproto_parser
-        cookie = cookie_mask = 0
-        idle_timeout = hard_timeout = 0
-        if flag == 1:
-            inst = [ofp_parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, actions)]
-        else:
-            inst = actions
-
-        if buffer_id:
-            req = ofp_parser.OFPFlowMod(datapath=datapath, cookie=cookie, cookie_mask=cookie_mask,
-                                    table_id=table_id, command=ofp.OFPFC_ADD,
-                                    idle_timeout=idle_timeout, hard_timeout=hard_timeout,
-                                    priority=priority, buffer_id=buffer_id,
-                                    match=match, instructions=inst)
-        else:
-            req = ofp_parser.OFPFlowMod(datapath=datapath, cookie=cookie, cookie_mask=cookie_mask,
-                                        table_id=table_id, command=ofp.OFPFC_ADD,
-                                        idle_timeout=idle_timeout, hard_timeout=hard_timeout,
-                                        priority=priority, buffer_id=ofp.OFP_NO_BUFFER,
-                                        match=match, instructions=inst)
-
-        datapath.send_msg(req)
-
-    # List the event list should be listened.
-    events = [event.EventSwitchEnter,
-                  event.EventSwitchLeave, event.EventPortAdd,
-                  event.EventPortDelete, event.EventPortModify,
-                  event.EventLinkAdd, event.EventLinkDelete]
-
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def _packet_in_handler(self, ev):
         msg = ev.msg
         datapath = msg.datapath
-        dpid=datapath.id
+        dpid = datapath.id
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
         pkt = packet.Packet(msg.data)
@@ -151,14 +98,15 @@ class ProjectController(app_manager.RyuApp):
             arp_src_ip = arp_pkt.src_ip
             arp_dst_ip = arp_pkt.dst_ip
             src_mac = arp_pkt.src_mac
+            # check if the src_ip is the known host
             if arp_src_ip not in self.hosts.keys():
-                self.net.add_node(src_mac,arp_src_ip=src_mac,sw=dpid,port=in_port)
-                self.sw_host[dpid]=[src_mac,in_port]
-                self.hosts[arp_src_ip]=[src_mac,dpid,in_port]
-                self.net.add_edge(src_mac,dpid,{'port': in_port})
-                self.net.add_edge(dpid,src_mac,{'port':in_port})
+                # add the host to the net and the host dict
+                self.net.add_node(src_mac, arp_src_ip=src_mac, sw=dpid, port=in_port)
+                self.hosts[arp_src_ip] = [src_mac, dpid,in_port]
+                self.net.add_edge(src_mac, dpid, {'port': in_port})
+                self.net.add_edge(dpid, src_mac, {'port':in_port})
             if arp_dst_ip in self.hosts.keys():
-                mac=self.hosts[arp_dst_ip][0]
+                mac = self.hosts[arp_dst_ip][0]
                 datapath_id, out_port = self.net.node[mac]['sw'], self.net.node[mac]['port']
                 buffer_id=ofproto.OFP_NO_BUFFER
                 datapath=self.datapaths[datapath_id]
@@ -209,26 +157,17 @@ class ProjectController(app_manager.RyuApp):
                     ints.append(parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions))
                     if msg.buffer_id != ofproto.OFP_NO_BUFFER:
                         self.modflow(self.datapaths[dpid], 1, 100, match, ints, msg.buffer_id)
-                        print ('add flow ',dpid,match,ints)
+                        print (' add flow:', dpid,
+                               ' eth_dst:', dst,
+                               ' in_port:', in_port,
+                               ' out_port:', out_port)
                     else:
                         self.modflow(self.datapaths[dpid], 1, 100, match, ints)
-                        print ('add flow ', dpid, match, ints)
-                    ints=[]
-
-                ''' out_port = ofproto.OFPP_FLOOD
-                actions = [parser.OFPActionOutput(out_port)]
-                match = parser.OFPMatch(in_port=in_port, eth_dst=dst)
-                if msg.buffer_id != ofproto.OFP_NO_BUFFER:
-                    ints.append(parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions))
-                    self.modflow(datapath, 1, 100, match, actions, msg.buffer_id)
-                    print ('add flow to flood ', dpid, match, ints)
-                    return
-                else:
-                    ints.append(parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions))
-                    self.modflow(datapath, 1, 100, match, ints)
-                    print ('add flow to flood ', dpid, match, ints)
-                ints=[]
-                '''
+                        print (' add flow:', dpid,
+                               ' eth_dst:', dst,
+                               ' in_port:', in_port,
+                               ' out_port:', out_port)
+                    ints = []
                 out_port=self.net[path[1]][path[2]]['port']
                 actions=[parser.OFPActionOutput(out_port)]
                 data = None
@@ -240,11 +179,9 @@ class ProjectController(app_manager.RyuApp):
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
-
         datapath = ev.msg.datapath
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
-
         # install table-miss flow entry
         #
         # We specify NO BUFFER to max_len of the output action due to
@@ -252,35 +189,33 @@ class ProjectController(app_manager.RyuApp):
         # 128, OVS will send Packet-In with invalid buffer_id and
         # truncated packet data. In that case, we cannot output packets
         # correctly.  The bug has been fixed in OVS v2.1.0.
+
         match = parser.OFPMatch()
         insts = []
         insts.append(parser.OFPInstructionGotoTable(1))
-
-        #self.add_flow(datapath, 0, match, actions)
-        #send_flow_mod(self, datapath, table_id, priority, match, actions, buffer_id=None)
-        #def modflow(self, datapath, table_id, priority, match, instructions, buffer_id=None):
+        # send the miss matched packets from table 0 to table 1
+        # another table miss entry will be installed automatically with priority=0
         self.modflow(datapath,0,100,match,insts)
-        insts = []
 
-        actions=[parser.OFPActionOutput(ofproto.OFPP_CONTROLLER,
+        insts = []
+        actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER,
                                           ofproto.OFPCML_NO_BUFFER)]
         insts.append(parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions))
-
+        # send the miss matched packets to the controller
+        # this is the table miss entry in table 1
         self.modflow(datapath, 1, 0, match, insts)
+
         match=parser.OFPMatch(vlan_vid=0x0011)
         insts = []
-        actions=[parser.OFPActionOutput(ofproto.OFPP_CONTROLLER,
-                                          ofproto.OFPCML_NO_BUFFER)]
+        actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER,
+                                        ofproto.OFPCML_NO_BUFFER)]
         insts.append(parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS,
                                                   actions))
         insts.append(parser.OFPInstructionGotoTable(1))
-        self.modflow(datapath,0,101,match,insts)
-        print 'all ready!'
-
-
-
-
-
+        # send the copyt of packets with vlan_vid=3 to the controller
+        # and then send to the table 1
+        self.modflow(datapath, 0, 101, match,insts)
+        print ('switch ', datapath, 'is ready!')
 
     @set_ev_cls(event.EventSwitchEnter)
     def get_topology_data(self, ev):
@@ -291,10 +226,10 @@ class ProjectController(app_manager.RyuApp):
         links_list = get_link(self.topology_api_app, None)
         # print links_list
         links = [(link.src.dpid, link.dst.dpid, {'port': link.src.port_no}) for link in links_list]
-        # print links
+        # add_edges src to dst
         self.net.add_edges_from(links)
         links = [(link.dst.dpid, link.src.dpid, {'port': link.dst.port_no}) for link in links_list]
-        # print links
+        # add_edges dst to src
         self.net.add_edges_from(links)
         print "**********List of links"
         print self.net.edges()
@@ -305,17 +240,3 @@ class ProjectController(app_manager.RyuApp):
             print "Novo link"
             self.no_of_links += 1
         '''
-
-
-        # print "@@@@@@@@@@@@@@@@@Printing both arrays@@@@@@@@@@@@@@@"
-        # for node in self.nodes:
-        #    print self.nodes[node]
-        # for link in self.links:
-        #    print self.links[link]
-        # print self.no_of_nodes
-        # print self.no_of_links
-
-        # @set_ev_cls(event.EventLinkAdd)
-        # def get_links(self, ev):
-        # print "################Something##############"
-        # print ev.link.src, ev.link.dst
