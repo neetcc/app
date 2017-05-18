@@ -32,10 +32,11 @@ class ProjectController(app_manager.RyuApp):
         self.net = nx.DiGraph()
         self.nodes = {}
         self.links = {}
-        self.paths={}
+        self.paths={}  # the dict to save the paths of the network[src,dst]:pathlist
         self.datapaths = {}  # dpid: datapath the dict to get the datapath from dpid
         self.hosts = {}  # host_ip:[host_mac, dpid(the switch connected to), in_port(to the switch)]
         # self.discover_thread = hub.spawn(self._discover)
+        self.host_mac2ip = {} # host_mac: host_ip
 
     @set_ev_cls(ofp_event.EventOFPStateChange,
                 [MAIN_DISPATCHER, DEAD_DISPATCHER])
@@ -82,9 +83,6 @@ class ProjectController(app_manager.RyuApp):
         arp_pkt = pkt.get_protocol(arp.arp)
         ip_pkt = pkt.get_protocol(ipv4.ipv4)
         in_port = msg.match['in_port']
-        buffer_id = msg.buffer_id
-
-        ints = []
         if isinstance(arp_pkt, arp.arp):
             print "ARP processing"
             arp_src_ip = arp_pkt.src_ip
@@ -93,17 +91,17 @@ class ProjectController(app_manager.RyuApp):
             # check if the src_ip is the known host
             if arp_src_ip not in self.hosts.keys():
                 # add the host to the net and the host dict
-                self.net.add_node(src_mac, arp_src_ip=src_mac, sw=dpid, port=in_port)
+                self.net.add_node(arp_src_ip, mac=src_mac, sw=dpid, port=in_port)
                 self.hosts[arp_src_ip] = [src_mac, dpid, in_port]
-                self.net.add_edge(src_mac, dpid, {'port': in_port})
-                self.net.add_edge(dpid, src_mac, {'port': in_port})
+                self.host_mac2ip[src_mac]=arp_src_ip
+                self.net.add_edge(arp_src_ip, dpid, {'port': in_port})
+                self.net.add_edge(dpid, arp_src_ip, {'port': in_port})
             if arp_dst_ip in self.hosts.keys():
-                mac = self.hosts[arp_dst_ip][0]
-                datapath_id, out_port = self.net.node[mac]['sw'], self.net.node[mac]['port']
+                #mac = self.hosts[arp_dst_ip][0]
+                datapath_id, out_port = self.net.node[arp_dst_ip]['sw'], self.net.node[arp_dst_ip]['port']
                 buffer_id = ofproto.OFP_NO_BUFFER
                 datapath = self.datapaths[datapath_id]
                 in_port = ofproto.OFPP_CONTROLLER
-                in_port = in_port
                 print "Reply ARP to knew host"
             else:
                 # for datapath in self.datapaths:
@@ -127,48 +125,52 @@ class ProjectController(app_manager.RyuApp):
             src_ip = ip_pkt.src
             dst_ip = ip_pkt.dst
             self.mac_to_port.setdefault(dpid, {})
-            if src not in self.net:
-                self.net.add_node(src, ip=src_ip)
-                self.net.add_edge(dpid, src, {'port': in_port})
-                self.net.add_edge(src, dpid, {'port': in_port})
-            if dst in self.net:
-                path = nx.shortest_path(self.net, src, dst)
-                self.paths[src,dst]=path
-                k = len(path) - 1
-                for index in range(len(path) - 1):
-                    if index == 0:
-                        continue
-                    if index == len(path) - 1:
-                        continue
-                    dpid = path[index]
-                    pre = path[index - 1]
-                    nxt = path[index + 1]
-                    in_port = self.net[dpid][pre]['port']
-                    out_port = self.net[dpid][nxt]['port']
-                    match = parser.OFPMatch(in_port=in_port, eth_dst=dst)
-                    actions = [parser.OFPActionOutput(out_port)]
-                    ints.append(parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions))
-                    if msg.buffer_id != ofproto.OFP_NO_BUFFER:
-                        self.modflow(self.datapaths[dpid], 1, 100, match, ints, msg.buffer_id)
-                        print (' add flow:', dpid,
-                               ' eth_dst:', dst,
-                               ' in_port:', in_port,
-                               ' out_port:', out_port)
-                    else:
-                        self.modflow(self.datapaths[dpid], 1, 100, match, ints)
-                        print (' add flow:', dpid,
-                               ' eth_dst:', dst,
-                               ' in_port:', in_port,
-                               ' out_port:', out_port)
-                    ints = []
+            if src_ip not in self.net:
+                self.net.add_node(src_ip, mac=src_ip)
+                self.net.add_edge(dpid, src_ip, {'port': in_port})
+                self.net.add_edge(src_ip, dpid, {'port': in_port})
+            if dst_ip in self.net:
+                path = nx.shortest_path(self.net, src_ip, dst_ip)
+                # add the path to the path dict
+                self.paths[src_ip, dst_ip] = path
+                self.set_path(path)
+                # send back the buffered packets
                 out_port = self.net[path[1]][path[2]]['port']
                 actions = [parser.OFPActionOutput(out_port)]
-                data = None
-                if msg.buffer_id == ofproto.OFP_NO_BUFFER:
-                    data = msg.data
+                data = msg.data
                 out = parser.OFPPacketOut(datapath=datapath, buffer_id=msg.buffer_id,
                                           in_port=in_port, actions=actions, data=data)
                 datapath.send_msg(out)
+
+    # install flow entry to one path the src and dst is the ethernet mac
+    def set_path(self,path):
+        src_ip=path[0]
+        dst_ip=path[-1]
+        datapath=self.datapaths[path[1]]
+        parser=datapath.ofproto_parser
+        ofproto=datapath.ofproto
+        ints=[]
+        for index in range(len(path) - 1):
+            if index == 0:
+                continue
+            if index == len(path) - 1:
+                continue
+            dpid = path[index]
+            pre = path[index - 1]
+            nxt = path[index + 1]
+            in_port = self.net[dpid][pre]['port']
+            out_port = self.net[dpid][nxt]['port']
+            match = parser.OFPMatch(in_port=in_port,eth_dst=self.hosts[dst_ip][0])
+            actions = [parser.OFPActionOutput(out_port)]
+            ints.append(parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions))
+            self.modflow(self.datapaths[dpid], 1, 100, match, ints)
+            print (' add flow:', dpid,
+                   ' ipdst:', dst_ip,
+                   ' in_port:', in_port,
+                   ' out_port:', out_port)
+            ints = []
+
+
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
