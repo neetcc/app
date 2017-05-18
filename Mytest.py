@@ -37,6 +37,11 @@ class ProjectController(app_manager.RyuApp):
         self.hosts = {}  # host_ip:[host_mac, dpid(the switch connected to), in_port(to the switch)]
         # self.discover_thread = hub.spawn(self._discover)
         self.host_mac2ip = {} # host_mac: host_ip
+        # the flow entry need to mod [datapath,dst_ip,inport]: outport
+        self.flows={}  # [src_ip ,dst_ip] : {[datapath,dst_ip,inport]:outport}
+        self.add_dic={}
+        self.del_dic={}
+        self.mod_dic={}
 
     @set_ev_cls(ofp_event.EventOFPStateChange,
                 [MAIN_DISPATCHER, DEAD_DISPATCHER])
@@ -52,6 +57,7 @@ class ProjectController(app_manager.RyuApp):
                 self.logger.debug('unregister datapath: %016x', datapath.id)
                 del self.datapaths[datapath.id]
 
+    @staticmethod
     def modflow(self, datapath, table_id, priority, match, instructions, buffer_id=None):
         ofp = datapath.ofproto
         ofp_parser = datapath.ofproto_parser
@@ -70,6 +76,32 @@ class ProjectController(app_manager.RyuApp):
                                         priority=priority, buffer_id=ofp.OFP_NO_BUFFER,
                                         match=match, instructions=instructions)
 
+        datapath.send_msg(req)
+
+        # delete a flow entry of match in table id
+    @staticmethod
+    def delete_entry(self, datapath, table_id, match, instructions):
+        ofproto = datapath.ofproto
+        req = datapath.ofproto_parser.OFPFlowMod(datapath, 0, 0, table_id,
+                                                      ofproto.OFPFC_DELETE, 0, 0, 1,
+                                                      ofproto.OFPCML_NO_BUFFER,
+                                                      ofproto.OFPP_ANY,ofproto.OFPG_ANY,
+                                                      0,match, instructions)
+        datapath.send_msg(req)
+
+        # delete all the flow entry in table id
+    @staticmethod
+    def delete_all(self, datapath,table_id):
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+        match=parser.OFPMatch()
+        ints=[]
+        req=datapath.ofproto_parser.OFPFlowMod(datapath, 0, 0, table_id,
+                                               ofproto.OFPFC_DELETE, 0, 0, 1,
+                                               ofproto.OFPCML_NO_BUFFER,
+                                               ofproto.OFPP_ANY,ofproto.OFPG_ANY,
+                                               0, match, ints)
+        print 'del all flow entries in table', 0
         datapath.send_msg(req)
 
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
@@ -164,6 +196,7 @@ class ProjectController(app_manager.RyuApp):
             actions = [parser.OFPActionOutput(out_port)]
             ints.append(parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions))
             self.modflow(self.datapaths[dpid], 1, 100, match, ints)
+            self.flows[src_ip, dst_ip][dpid,dst_ip,in_port] =out_port
             print (' add flow:', dpid,
                    ' ipdst:', dst_ip,
                    ' in_port:', in_port,
@@ -212,7 +245,6 @@ class ProjectController(app_manager.RyuApp):
         self.modflow(datapath, 0, 101, match, insts)
         print ('switch ', datapath.id, 'is ready!')
 
-
     @set_ev_cls(event.EventSwitchEnter)
     def get_topology_data(self, ev):
         switch_list = get_switch(self.topology_api_app, None)
@@ -231,3 +263,37 @@ class ProjectController(app_manager.RyuApp):
         print "**********List of links"
         print self.net.edges()
 
+    def compare(self):
+        update = {}
+        for src_ip in self.hosts.keys():
+            for dst_ip in self.hosts.keys():
+                if src_ip == dst_ip:
+                    continue
+                old_path_entry = self.flows[src_ip,dst_ip]
+                new_path = nx.shortest_path_length(self.net, src_ip, dst_ip, weight=None)
+                new_path_entry = {}
+                for index in range(len(new_path) - 1):
+                    if index == 0:
+                        continue
+                    if index == len(new_path) - 1:
+                        continue
+                    dpid = new_path[index]
+                    pre = new_path[index - 1]
+                    nxt = new_path[index + 1]
+                    in_port = self.net[dpid][pre]['port']
+                    out_port = self.net[dpid][nxt]['port']
+                    new_path_entry[dpid,dst_ip,in_port]=out_port
+                    if [dpid,dst_ip,in_port] not in old_path_entry:
+                        self.add_dic[dpid, dst_ip, in_port] = out_port
+                    else:
+                        if old_path_entry[dpid, dst_ip, in_port]!= out_port:
+                            self.mod_dic[dpid, dst_ip, in_port] = out_port
+                for key in old_path_entry.keys():
+                    if key not in new_path_entry:
+                        self.del_dic[dpid, dst_ip, in_port]=out_port # in the matchfield it will be []
+                # each paths' update will be saved
+                update[src_ip,dst_ip] = [self.add_dic.copy(), self.mod_dic.copy(), self.del_dic.copy()]
+                self.add_dic.clear()
+                self.mod_dic.clear()
+                self.del_dic.clear()
+        return update
