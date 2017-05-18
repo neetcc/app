@@ -57,7 +57,7 @@ class ProjectController(app_manager.RyuApp):
                 self.logger.debug('unregister datapath: %016x', datapath.id)
                 del self.datapaths[datapath.id]
 
-    @staticmethod
+
     def modflow(self, datapath, table_id, priority, match, instructions, buffer_id=None):
         ofp = datapath.ofproto
         ofp_parser = datapath.ofproto_parser
@@ -79,7 +79,6 @@ class ProjectController(app_manager.RyuApp):
         datapath.send_msg(req)
 
         # delete a flow entry of match in table id
-    @staticmethod
     def delete_entry(self, datapath, table_id, match, instructions):
         ofproto = datapath.ofproto
         req = datapath.ofproto_parser.OFPFlowMod(datapath, 0, 0, table_id,
@@ -126,8 +125,8 @@ class ProjectController(app_manager.RyuApp):
                 self.net.add_node(arp_src_ip, mac=src_mac, sw=dpid, port=in_port)
                 self.hosts[arp_src_ip] = [src_mac, dpid, in_port]
                 self.host_mac2ip[src_mac]=arp_src_ip
-                self.net.add_edge(arp_src_ip, dpid, {'port': in_port})
-                self.net.add_edge(dpid, arp_src_ip, {'port': in_port})
+                self.net.add_edge(arp_src_ip, dpid, {'port': in_port, 'weight': 1})
+                self.net.add_edge(dpid, arp_src_ip, {'port': in_port, 'weight': 1})
             if arp_dst_ip in self.hosts.keys():
                 #mac = self.hosts[arp_dst_ip][0]
                 datapath_id, out_port = self.net.node[arp_dst_ip]['sw'], self.net.node[arp_dst_ip]['port']
@@ -159,10 +158,10 @@ class ProjectController(app_manager.RyuApp):
             self.mac_to_port.setdefault(dpid, {})
             if src_ip not in self.net:
                 self.net.add_node(src_ip, mac=src_ip)
-                self.net.add_edge(dpid, src_ip, {'port': in_port})
-                self.net.add_edge(src_ip, dpid, {'port': in_port})
+                self.net.add_edge(dpid, src_ip, {'port': in_port, 'weight': 1})
+                self.net.add_edge(src_ip, dpid, {'port': in_port, 'weight': 1})
             if dst_ip in self.net:
-                path = nx.shortest_path(self.net, src_ip, dst_ip)
+                path = nx.shortest_path(self.net, src_ip, dst_ip, weight='weight')
                 # add the path to the path dict
                 self.paths[src_ip, dst_ip] = path
                 self.set_path(path)
@@ -196,7 +195,8 @@ class ProjectController(app_manager.RyuApp):
             actions = [parser.OFPActionOutput(out_port)]
             ints.append(parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions))
             self.modflow(self.datapaths[dpid], 1, 100, match, ints)
-            self.flows[src_ip, dst_ip][dpid,dst_ip,in_port] =out_port
+            # every time set a flow , it will be save in flows
+            self.flows[src_ip+dst_ip]= {str(dpid)+dst_ip+str(in_port):out_port}
             print (' add flow:', dpid,
                    ' ipdst:', dst_ip,
                    ' in_port:', in_port,
@@ -233,7 +233,7 @@ class ProjectController(app_manager.RyuApp):
         # this is the table miss entry in table 1
         self.modflow(datapath, 1, 0, match, insts)
 
-        match = parser.OFPMatch(vlan_vid=0x0011)
+        match = parser.OFPMatch(vlan_pcp=1, vlan_vid=5|ofproto_v1_3.OFPVID_PRESENT)
         insts = []
         actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER,
                                           ofproto.OFPCML_NO_BUFFER)]
@@ -254,10 +254,10 @@ class ProjectController(app_manager.RyuApp):
 
         links_list = get_link(self.topology_api_app, None)
         # print links_list
-        links = [(link.src.dpid, link.dst.dpid, {'port': link.src.port_no}) for link in links_list]
+        links = [(link.src.dpid, link.dst.dpid, {'port': link.src.port_no, 'weight': 1}) for link in links_list]
         # add_edges src to dst
         self.net.add_edges_from(links)
-        links = [(link.dst.dpid, link.src.dpid, {'port': link.dst.port_no}) for link in links_list]
+        links = [(link.dst.dpid, link.src.dpid, {'port': link.dst.port_no, 'weight': 1}) for link in links_list]
         # add_edges dst to src
         self.net.add_edges_from(links)
         print "**********List of links"
@@ -269,8 +269,8 @@ class ProjectController(app_manager.RyuApp):
             for dst_ip in self.hosts.keys():
                 if src_ip == dst_ip:
                     continue
-                old_path_entry = self.flows[src_ip,dst_ip]
-                new_path = nx.shortest_path_length(self.net, src_ip, dst_ip, weight=None)
+                old_path_entry = self.flows[src_ip+dst_ip]
+                new_path = nx.shortest_path_length(self.net, src_ip, dst_ip, weight='weight')
                 new_path_entry = {}
                 for index in range(len(new_path) - 1):
                     if index == 0:
@@ -283,16 +283,16 @@ class ProjectController(app_manager.RyuApp):
                     in_port = self.net[dpid][pre]['port']
                     out_port = self.net[dpid][nxt]['port']
                     new_path_entry[dpid,dst_ip,in_port]=out_port
-                    if [dpid,dst_ip,in_port] not in old_path_entry:
-                        self.add_dic[dpid, dst_ip, in_port] = out_port
+                    if [str(dpid)+dst_ip+str(in_port)] not in old_path_entry:
+                        self.add_dic[str(dpid)+ dst_ip+ str(in_port)] = out_port
                     else:
-                        if old_path_entry[dpid, dst_ip, in_port]!= out_port:
-                            self.mod_dic[dpid, dst_ip, in_port] = out_port
+                        if old_path_entry[str(dpid)+ dst_ip+ str(in_port)]!= out_port:
+                            self.mod_dic[str(dpid)+ dst_ip+ str(in_port)] = out_port
                 for key in old_path_entry.keys():
                     if key not in new_path_entry:
-                        self.del_dic[dpid, dst_ip, in_port]=out_port # in the matchfield it will be []
+                        self.del_dic[str(dpid)+ dst_ip+ str(in_port)]=out_port # in the matchfield it will be []
                 # each paths' update will be saved
-                update[src_ip,dst_ip] = [self.add_dic.copy(), self.mod_dic.copy(), self.del_dic.copy()]
+                update[src_ip+dst_ip] = [self.add_dic.copy(), self.mod_dic.copy(), self.del_dic.copy()]
                 self.add_dic.clear()
                 self.mod_dic.clear()
                 self.del_dic.clear()
