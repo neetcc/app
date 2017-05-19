@@ -3,30 +3,34 @@ import logging
 import struct
 
 from ryu.base import app_manager
-from ryu.controller import mac_to_port
 from ryu.controller import ofp_event
 from ryu.controller.handler import MAIN_DISPATCHER, DEAD_DISPATCHER ,CONFIG_DISPATCHER
 from ryu.controller.handler import set_ev_cls
 from ryu.ofproto import ofproto_v1_3
-from ryu.lib.mac import haddr_to_bin
 from ryu.lib.packet import packet
 from ryu.lib.packet import ethernet
 from ryu.lib.packet import ether_types
 from ryu.topology.api import get_switch, get_link, get_all_host
-from ryu.app.wsgi import ControllerBase
-from ryu.topology import event, switches
+from ryu.topology import event
 import networkx as nx
 from ryu.lib.packet import ipv4
 from ryu.lib.packet import arp
-from ryu.lib import hub
-import setting
+from ryu.lib import dpid as dpid_lib
+from webob import Response
+import json
+from ryu.app.wsgi import WSGIApplication, ControllerBase, route
+#import MyController
+url = '/my/{dpid}'
 
 
 class ProjectController(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
+    _CONTEXTS ={'wsgi': WSGIApplication}
 
     def __init__(self, *args, **kwargs):
         super(ProjectController, self).__init__(*args, **kwargs)
+        wsgi = kwargs['wsgi']
+        wsgi.register(MyController, {'Myapp': self})
         self.mac_to_port = {}
         self.topology_api_app = self
         self.net = nx.DiGraph()
@@ -297,3 +301,19 @@ class ProjectController(app_manager.RyuApp):
                 self.mod_dic.clear()
                 self.del_dic.clear()
         return update
+
+
+
+class MyController(ControllerBase):
+
+    def __init__(self, req, link, data, **config):
+        super(MyController, self).__init__(req, link, data, **config)
+        self.myapp = data['Myapp']
+
+
+    @route('my',url,methods=['GET'], requirements=[])
+    def show(self,req,**kwargs):
+        app=self.myapp
+        body=json.dumps({'abc':2})
+        return Response(content_type='application/json', body=body)
+
