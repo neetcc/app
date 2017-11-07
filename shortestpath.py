@@ -35,9 +35,9 @@ class ProjectController(app_manager.RyuApp):
         self.switch_port_table = {}  # dpip->port_num
         self.access_ports = {}       # dpid->port_num
         self.interior_ports = {}     # dpid->port_num
-        self.net = nx.DiGraph()
-        self.nodes = {}
-        self.links = {}
+        self.net = nx.DiGraph()     #network graph
+        self.nodes = {}             #dictionary for each switch and computer
+        self.links = {}             #dictionary for each link between nodes
         self.datapaths={} # dpid: datapath the dict to get the datapath from dpid
         self.hosts={} # host_ip:[host_mac, dpid(the switch connected to), in_port(to the switch)]
         self.no_of_nodes = 0
